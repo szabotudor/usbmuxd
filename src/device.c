@@ -266,7 +266,7 @@ static int send_anon_rst(struct mux_device *dev, uint16_t sport, uint16_t dport,
 	th.th_sport = htons(sport);
 	th.th_dport = htons(dport);
 	th.th_ack = htonl(ack);
-	th.th_flags = TH_RST;
+	th.th_flags = TH_RST | TH_ACK;
 	th.th_off = sizeof(th) / 4;
 
 	usbmuxd_log(LL_DEBUG, "[OUT] dev=%d sport=%d dport=%d flags=0x%x", dev->id, sport, dport, th.th_flags);
@@ -307,7 +307,7 @@ static void connection_teardown(struct mux_connection *conn)
 		return;
 	usbmuxd_log(LL_DEBUG, "connection_teardown dev %d sport %d dport %d", conn->dev->id, conn->sport, conn->dport);
 	if(conn->dev->state != MUXDEV_DEAD && conn->state != CONN_DYING && conn->state != CONN_REFUSED) {
-		res = send_tcp(conn, TH_RST, NULL, 0);
+		res = send_tcp(conn, TH_RST | TH_ACK, NULL, 0);
 		if(res < 0)
 			usbmuxd_log(LL_ERROR, "Error sending TCP RST to device %d (%d->%d)", conn->dev->id, conn->sport, conn->dport);
 	}
@@ -513,6 +513,12 @@ void device_client_process(int device_id, struct mux_client *client, short event
 			return;
 		}
 		conn->tx_seq += size;
+	}
+
+	if(events & (POLLHUP | POLLERR)) {
+		usbmuxd_log(LL_DEBUG, "client fd HUP/ERR on device %d connection %d->%d, tearing down", conn->dev->id, conn->sport, conn->dport);
+		connection_teardown(conn);
+		return;
 	}
 
 	update_connection(conn);
@@ -794,7 +800,7 @@ void device_data_input(struct usb_device *usbdev, unsigned char *buffer, uint32_
 	uint32_t payload_length;
 
 	if (dev->version >= 2) {
-		dev->rx_seq = ntohs(mhdr->rx_seq);
+		dev->rx_seq = ntohs(mhdr->tx_seq);
 	}
 
 	switch(ntohl(mhdr->protocol)) {
