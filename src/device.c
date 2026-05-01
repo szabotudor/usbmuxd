@@ -307,9 +307,12 @@ static void connection_teardown(struct mux_connection *conn)
 		return;
 	usbmuxd_log(LL_DEBUG, "connection_teardown dev %d sport %d dport %d", conn->dev->id, conn->sport, conn->dport);
 	if(conn->dev->state != MUXDEV_DEAD && conn->state != CONN_DYING && conn->state != CONN_REFUSED) {
-		res = send_tcp(conn, TH_RST | TH_ACK, NULL, 0);
+		uint8_t flags = (conn->state == CONN_CONNECTED) ? (TH_FIN | TH_ACK) : (TH_RST | TH_ACK);
+		res = send_tcp(conn, flags, NULL, 0);
 		if(res < 0)
-			usbmuxd_log(LL_ERROR, "Error sending TCP RST to device %d (%d->%d)", conn->dev->id, conn->sport, conn->dport);
+			usbmuxd_log(LL_ERROR, "Error sending TCP %s to device %d (%d->%d)",
+				(conn->state == CONN_CONNECTED) ? "FIN" : "RST",
+				conn->dev->id, conn->sport, conn->dport);
 	}
 	if(conn->client) {
 		if(conn->state == CONN_REFUSED || conn->state == CONN_CONNECTING) {
@@ -664,7 +667,7 @@ static void device_tcp_input(struct mux_device *dev, struct tcphdr *th, unsigned
 	} ENDFOREACH
 
 	if(!conn) {
-		if(!(th->th_flags & TH_RST)) {
+		if(!(th->th_flags & TH_RST) && !(th->th_flags & TH_FIN)) {
 			usbmuxd_log(LL_INFO, "No connection for device %d incoming packet %d->%d", dev->id, dport, sport);
 			if(send_anon_rst(dev, sport, dport, ntohl(th->th_seq)) < 0)
 				usbmuxd_log(LL_ERROR, "Error sending TCP RST to device %d (%d->%d)", dev->id, sport, dport);
