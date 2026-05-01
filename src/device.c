@@ -53,6 +53,7 @@ int next_device_id;
 #define ACK_TIMEOUT 30
 #define SYN_TIMEOUT 500
 #define SYN_MAX_RETRIES 3
+#define DATA_STALL_TIMEOUT 1000
 
 enum mux_protocol {
 	MUX_PROTO_VERSION = 0,
@@ -114,6 +115,7 @@ struct mux_connection
 	uint32_t ob_capacity;
 	short events;
 	uint64_t last_ack_time;
+	uint64_t last_data_tx_time;
 };
 
 struct mux_device
@@ -298,6 +300,8 @@ static int send_tcp(struct mux_connection *conn, uint8_t flags, const unsigned c
 		conn->tx_acked = conn->tx_ack;
 		conn->last_ack_time = mstime64();
 		conn->flags &= ~CONN_ACK_PENDING;
+		if(length > 0)
+			conn->last_data_tx_time = conn->last_ack_time;
 	}
 	return res;
 }
@@ -388,6 +392,7 @@ int device_start_connect(int device_id, uint16_t dport, struct mux_client *clien
 	conn->rx_recvd = 0;
 	conn->flags = 0;
 	conn->max_payload = USB_MTU - sizeof(struct mux_header) - sizeof(struct tcphdr);
+	conn->last_data_tx_time = 0;
 
 	conn->ob_buf = malloc(CONN_OUTBUF_SIZE);
 	conn->ob_capacity = CONN_OUTBUF_SIZE;
@@ -973,6 +978,7 @@ int device_get_timeout(void)
 {
 	uint64_t oldest_ack = (uint64_t)-1LL;
 	uint64_t oldest_syn = (uint64_t)-1LL;
+	uint64_t oldest_stall = (uint64_t)-1LL;
 	mutex_lock(&device_list_mutex);
 	FOREACH(struct mux_device *dev, &device_list) {
 		if(dev->state == MUXDEV_ACTIVE) {
@@ -981,6 +987,10 @@ int device_get_timeout(void)
 					oldest_ack = conn->last_ack_time;
 				if(conn->state == CONN_CONNECTING && conn->last_ack_time < oldest_syn)
 					oldest_syn = conn->last_ack_time;
+				if(conn->state == CONN_CONNECTED && conn->last_data_tx_time > 0 &&
+						(int32_t)(conn->tx_seq - conn->rx_ack) > 0 &&
+						conn->last_data_tx_time < oldest_stall)
+					oldest_stall = conn->last_data_tx_time;
 			} ENDFOREACH
 		}
 	} ENDFOREACH
@@ -995,6 +1005,11 @@ int device_get_timeout(void)
 	if((int64_t)oldest_syn != -1LL) {
 		uint64_t elapsed = ct - oldest_syn;
 		int t = (elapsed >= SYN_TIMEOUT) ? 0 : (int)(SYN_TIMEOUT - elapsed);
+		if(t < timeout) timeout = t;
+	}
+	if((int64_t)oldest_stall != -1LL) {
+		uint64_t elapsed = ct - oldest_stall;
+		int t = (elapsed >= DATA_STALL_TIMEOUT) ? 0 : (int)(DATA_STALL_TIMEOUT - elapsed);
 		if(t < timeout) timeout = t;
 	}
 	return timeout;
@@ -1012,6 +1027,15 @@ void device_check_timeouts(void)
 						(ct - conn->last_ack_time) > ACK_TIMEOUT) {
 					usbmuxd_log(LL_DEBUG, "Sending ACK due to expired timeout (%" PRIu64 " -> %" PRIu64 ")", conn->last_ack_time, ct);
 					send_tcp_ack(conn);
+				} else if(conn->state == CONN_CONNECTED &&
+						conn->last_data_tx_time > 0 &&
+						(int32_t)(conn->tx_seq - conn->rx_ack) > 0 &&
+						(ct - conn->last_data_tx_time) > DATA_STALL_TIMEOUT) {
+					usbmuxd_log(LL_INFO, "Data stall on device %d (%d->%d): sent %u bytes, iPhone ACKed only %u after %ums, closing",
+						conn->dev->id, conn->sport, conn->dport,
+						conn->tx_seq, conn->rx_ack,
+						(unsigned)(ct - conn->last_data_tx_time));
+					connection_teardown(conn);
 				} else if((conn->state == CONN_CONNECTING) &&
 						(ct - conn->last_ack_time) > SYN_TIMEOUT) {
 					if(conn->syn_retries < SYN_MAX_RETRIES) {
