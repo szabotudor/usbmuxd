@@ -51,6 +51,8 @@ int next_device_id;
 #define CONN_OUTBUF_SIZE	65536
 
 #define ACK_TIMEOUT 30
+#define SYN_TIMEOUT 500
+#define SYN_MAX_RETRIES 3
 
 enum mux_protocol {
 	MUX_PROTO_VERSION = 0,
@@ -104,6 +106,7 @@ struct mux_connection
 	uint32_t max_payload;
 	uint32_t sendable;
 	int flags;
+	int syn_retries;
 	unsigned char *ib_buf;
 	uint32_t ib_size;
 	uint32_t ib_capacity;
@@ -968,23 +971,33 @@ int device_get_list(int include_hidden, struct device_info **devices)
 
 int device_get_timeout(void)
 {
-	uint64_t oldest = (uint64_t)-1LL;
+	uint64_t oldest_ack = (uint64_t)-1LL;
+	uint64_t oldest_syn = (uint64_t)-1LL;
 	mutex_lock(&device_list_mutex);
 	FOREACH(struct mux_device *dev, &device_list) {
 		if(dev->state == MUXDEV_ACTIVE) {
 			FOREACH(struct mux_connection *conn, &dev->connections) {
-				if((conn->state == CONN_CONNECTED) && (conn->flags & CONN_ACK_PENDING) && conn->last_ack_time < oldest)
-					oldest = conn->last_ack_time;
+				if((conn->state == CONN_CONNECTED) && (conn->flags & CONN_ACK_PENDING) && conn->last_ack_time < oldest_ack)
+					oldest_ack = conn->last_ack_time;
+				if(conn->state == CONN_CONNECTING && conn->last_ack_time < oldest_syn)
+					oldest_syn = conn->last_ack_time;
 			} ENDFOREACH
 		}
 	} ENDFOREACH
 	mutex_unlock(&device_list_mutex);
 	uint64_t ct = mstime64();
-	if((int64_t)oldest == -1LL)
-		return 100000; //meh
-	if((ct - oldest) > ACK_TIMEOUT)
-		return 0;
-	return ACK_TIMEOUT - (ct - oldest);
+	int timeout = 100000;
+	if((int64_t)oldest_ack != -1LL) {
+		uint64_t elapsed = ct - oldest_ack;
+		int t = (elapsed >= ACK_TIMEOUT) ? 0 : (int)(ACK_TIMEOUT - elapsed);
+		if(t < timeout) timeout = t;
+	}
+	if((int64_t)oldest_syn != -1LL) {
+		uint64_t elapsed = ct - oldest_syn;
+		int t = (elapsed >= SYN_TIMEOUT) ? 0 : (int)(SYN_TIMEOUT - elapsed);
+		if(t < timeout) timeout = t;
+	}
+	return timeout;
 }
 
 void device_check_timeouts(void)
@@ -999,6 +1012,19 @@ void device_check_timeouts(void)
 						(ct - conn->last_ack_time) > ACK_TIMEOUT) {
 					usbmuxd_log(LL_DEBUG, "Sending ACK due to expired timeout (%" PRIu64 " -> %" PRIu64 ")", conn->last_ack_time, ct);
 					send_tcp_ack(conn);
+				} else if((conn->state == CONN_CONNECTING) &&
+						(ct - conn->last_ack_time) > SYN_TIMEOUT) {
+					if(conn->syn_retries < SYN_MAX_RETRIES) {
+						usbmuxd_log(LL_INFO, "Retrying SYN for device %d (%d->%d), attempt %d", conn->dev->id, conn->sport, conn->dport, conn->syn_retries + 1);
+						conn->syn_retries++;
+						if(send_tcp(conn, TH_SYN, NULL, 0) < 0) {
+							usbmuxd_log(LL_ERROR, "Error retrying TCP SYN for device %d (%d->%d)", conn->dev->id, conn->sport, conn->dport);
+							connection_teardown(conn);
+						}
+					} else {
+						usbmuxd_log(LL_INFO, "SYN retry limit reached for device %d (%d->%d), aborting", conn->dev->id, conn->sport, conn->dport);
+						connection_teardown(conn);
+					}
 				}
 			} ENDFOREACH
 		}
